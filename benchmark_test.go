@@ -1545,3 +1545,155 @@ func BenchmarkBitmapXorBulkMerge(b *testing.B) {
 		})
 	}
 }
+
+// rangeBenchmarkInputs builds four bitmaps of 256 containers each, all
+// arrays, all bitmaps or all runs depending on shape. The inputs overlap: the
+// array and bitmap shapes draw each container from a pool shared by the four
+// bitmaps, and the run shape offsets the same runs per bitmap.
+func rangeBenchmarkInputs(b *testing.B, shape string) []*Bitmap {
+	const numBitmaps = 4
+	const numContainers = 256
+	rng := rand.New(rand.NewSource(42))
+	bms := make([]*Bitmap, numBitmaps)
+	for i := range bms {
+		bms[i] = NewBitmap()
+	}
+	for key := 0; key < numContainers; key++ {
+		base := uint64(key) << 16
+		switch shape {
+		case "array", "bitmap":
+			poolSize := 3000
+			if shape == "bitmap" {
+				poolSize = 30000
+			}
+			pool := make([]uint32, poolSize)
+			for j := range pool {
+				pool[j] = uint32(base) + uint32(rng.Intn(1<<16))
+			}
+			for _, bm := range bms {
+				values := make([]uint32, 0, poolSize)
+				for _, v := range pool {
+					if rng.Intn(3) != 0 {
+						values = append(values, v)
+					}
+				}
+				bm.AddMany(values)
+			}
+		case "run":
+			for i, bm := range bms {
+				offset := uint64(rng.Intn(1000))
+				for r := 0; r < 8; r++ {
+					start := base + offset + uint64(r)*8000 + uint64(i*37)
+					end := start + 6000
+					if end > base+(1<<16) {
+						end = base + (1 << 16)
+					}
+					if start >= base+(1<<16) {
+						break
+					}
+					bm.AddRange(start, end)
+				}
+			}
+		}
+	}
+	if shape == "run" {
+		for _, bm := range bms {
+			bm.RunOptimize()
+		}
+	}
+	for _, bm := range bms {
+		for _, c := range bm.highlowcontainer.containers {
+			var ok bool
+			switch shape {
+			case "array":
+				_, ok = c.(*arrayContainer)
+			case "bitmap":
+				_, ok = c.(*bitmapContainer)
+			case "run":
+				_, ok = c.(*runContainer16)
+			}
+			if !ok {
+				b.Fatalf("%s workload produced a %T", shape, c)
+			}
+		}
+	}
+	return bms
+}
+
+// benchmarkFastRange times a range aggregation against the aggregate-then-clip
+// computation it replaces on a window two containers wide, and against the
+// plain aggregation on the whole value space, where both do the same work.
+func benchmarkFastRange(b *testing.B, name string, rangeFunc func(uint64, uint64, ...*Bitmap) *Bitmap, aggregate func(...*Bitmap) *Bitmap, viaRangeBitmap func(uint64, uint64, ...*Bitmap) *Bitmap) {
+	const start = uint64(100)<<16 + 1000
+	const end = uint64(102)<<16 + 1000
+	for _, shape := range []string{"array", "bitmap", "run"} {
+		bms := rangeBenchmarkInputs(b, shape)
+		want := aggregate(bms...)
+		want.RemoveRange(0, start)
+		want.RemoveRange(end, MaxRange)
+		if !rangeFunc(start, end, bms...).Equals(want) {
+			b.Fatalf("%sRange disagrees with %s on the %s workload", name, name, shape)
+		}
+		if !viaRangeBitmap(start, end, bms...).Equals(want) {
+			b.Fatalf("the range-bitmap form of %s disagrees with %s on the %s workload", name, name, shape)
+		}
+		b.Run(shape+"/narrow/"+name+"Range", func(b *testing.B) {
+			b.ReportAllocs()
+			for n := 0; n < b.N; n++ {
+				rangeFunc(start, end, bms...)
+			}
+		})
+		b.Run(shape+"/narrow/"+name+" via range bitmap", func(b *testing.B) {
+			b.ReportAllocs()
+			for n := 0; n < b.N; n++ {
+				viaRangeBitmap(start, end, bms...)
+			}
+		})
+		b.Run(shape+"/narrow/"+name+"+RemoveRange", func(b *testing.B) {
+			b.ReportAllocs()
+			for n := 0; n < b.N; n++ {
+				r := aggregate(bms...)
+				r.RemoveRange(0, start)
+				r.RemoveRange(end, MaxRange)
+			}
+		})
+		b.Run(shape+"/whole/"+name+"Range", func(b *testing.B) {
+			b.ReportAllocs()
+			for n := 0; n < b.N; n++ {
+				rangeFunc(0, MaxRange, bms...)
+			}
+		})
+		b.Run(shape+"/whole/"+name, func(b *testing.B) {
+			b.ReportAllocs()
+			for n := 0; n < b.N; n++ {
+				aggregate(bms...)
+			}
+		})
+	}
+}
+
+// The range-bitmap forms are what a caller can write today to keep the cost
+// proportional to the window: AndAny on a range bitmap, whose key merge
+// gallops over the filters, and FastAnd with the range bitmap in first
+// position.
+func orViaRangeBitmap(start, end uint64, bitmaps ...*Bitmap) *Bitmap {
+	r := NewBitmap()
+	r.AddRange(start, end)
+	r.AndAny(bitmaps...)
+	return r
+}
+
+func andViaRangeBitmap(start, end uint64, bitmaps ...*Bitmap) *Bitmap {
+	r := NewBitmap()
+	r.AddRange(start, end)
+	return FastAnd(append([]*Bitmap{r}, bitmaps...)...)
+}
+
+// go test -bench 'BenchmarkFast(Or|And)Range' -benchmem -run -
+func BenchmarkFastOrRange(b *testing.B) {
+	benchmarkFastRange(b, "FastOr", FastOrRange, FastOr, orViaRangeBitmap)
+}
+
+func BenchmarkFastAndRange(b *testing.B) {
+	benchmarkFastRange(b, "FastAnd", FastAndRange, FastAnd, andViaRangeBitmap)
+}

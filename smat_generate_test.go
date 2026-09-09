@@ -51,5 +51,6 @@ var smatActionSeqs = []smat.ActionSeq{
 		smat.ActionID('f'),
 		smat.ActionID('-'),
 		smat.ActionID('e'),
+		smat.ActionID('~'),
 	},
 }

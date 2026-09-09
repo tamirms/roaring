@@ -55,6 +55,7 @@ func getInvariants() []invariant {
 		{name: "doubleflip", test: doubleFlipInvariant},
 		{name: "iteratorbits", test: iteratorBitsInvariant},
 		{name: "unsetiteratorbits", test: unsetIteratorBitsInvariant},
+		{name: "rangeaggregation", test: rangeAggregationInvariant},
 	}
 }
 
@@ -124,6 +125,44 @@ func unsetIteratorBitsInvariant(t *testing.T, b *Bitmap) {
 	if !original.Equals(result) {
 		t.Errorf("bitmap reconstructed from unset iterator + flip should equal original, original card=%d, result card=%d",
 			original.GetCardinality(), result.GetCardinality())
+	}
+}
+
+// rangeAggregationInvariant checks that the range aggregations of a single
+// bitmap equal the bitmap clipped to the range, for ranges anchored on its
+// extent, and leave the bitmap unchanged.
+func rangeAggregationInvariant(t *testing.T, b *Bitmap) {
+	original := b.Clone()
+
+	var maxVal uint64 = 1000
+	if !b.IsEmpty() {
+		maxVal = uint64(b.Maximum()) + 1000
+	}
+
+	ranges := [][2]uint64{
+		{0, maxVal}, {0, maxVal / 2}, {maxVal / 3, maxVal}, {maxVal / 4, maxVal / 2},
+		{maxVal, maxVal}, {0, MaxRange},
+	}
+	for _, r := range ranges {
+		expected := original.Clone()
+		expected.RemoveRange(0, r[0])
+		expected.RemoveRange(r[1], MaxRange)
+
+		or := FastOrRange(r[0], r[1], b)
+		if !or.Equals(expected) {
+			t.Errorf("FastOrRange(%d, %d) should equal the clipped bitmap, expected card=%d, result card=%d",
+				r[0], r[1], expected.GetCardinality(), or.GetCardinality())
+		}
+		and := FastAndRange(r[0], r[1], b, b)
+		if !and.Equals(expected) {
+			t.Errorf("FastAndRange(%d, %d) should equal the clipped bitmap, expected card=%d, result card=%d",
+				r[0], r[1], expected.GetCardinality(), and.GetCardinality())
+		}
+	}
+
+	if !original.Equals(b) {
+		t.Errorf("range aggregations should leave the input unchanged, original card=%d, result card=%d",
+			original.GetCardinality(), b.GetCardinality())
 	}
 }
 

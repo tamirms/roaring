@@ -3,9 +3,13 @@ package roaring64
 // to run just these tests: go test -run TestFastAggregations*
 
 import (
+	"fmt"
+	"math"
+	"math/rand"
 	"slices"
 	"testing"
 
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -69,4 +73,345 @@ func TestIssue330_64bits(t *testing.T) {
 	assert.True(t, FastOr(bitmaps[2], bitmaps[1], bitmaps[0]).Equals(FastOr(bitmaps[0], bitmaps[1], bitmaps[2])))
 	assert.Equal(t, FastOr(bitmaps[2], bitmaps[1], bitmaps[0]).GetCardinality(), uint64(1040))
 	assert.Equal(t, FastOr(bitmaps[0], bitmaps[1], bitmaps[2]).GetCardinality(), uint64(1040))
+}
+
+func TestFastRangeAggregations(t *testing.T) {
+	andFunc := func(bitmaps ...*Bitmap) *Bitmap {
+		return FastAndRange(0, math.MaxUint64, bitmaps...)
+	}
+	orFunc := func(bitmaps ...*Bitmap) *Bitmap {
+		return FastOrRange(0, math.MaxUint64, bitmaps...)
+	}
+	testAggregations(t, andFunc, orFunc, nil)
+}
+
+// clipToRange removes every value of b outside [rangeStart, rangeEnd).
+// RemoveRange cannot express an end past math.MaxUint64, so that value is
+// removed on its own; no half-open range selects it.
+func clipToRange(b *Bitmap, rangeStart, rangeEnd uint64) {
+	if rangeStart >= rangeEnd {
+		b.Clear()
+		return
+	}
+	b.RemoveRange(0, rangeStart)
+	b.RemoveRange(rangeEnd, math.MaxUint64)
+	b.Remove(math.MaxUint64)
+}
+
+// referenceOrRange is the materialize-then-clip computation FastOrRange
+// replaces.
+func referenceOrRange(rangeStart, rangeEnd uint64, bitmaps ...*Bitmap) *Bitmap {
+	answer := FastOr(bitmaps...)
+	clipToRange(answer, rangeStart, rangeEnd)
+	return answer
+}
+
+// referenceAndRange is the materialize-then-clip computation FastAndRange
+// replaces.
+func referenceAndRange(rangeStart, rangeEnd uint64, bitmaps ...*Bitmap) *Bitmap {
+	answer := FastAnd(bitmaps...)
+	clipToRange(answer, rangeStart, rangeEnd)
+	return answer
+}
+
+// roaringArray64Snapshot records everything a range aggregation must leave
+// alone in an input: the copy-on-write setting, the keys, the container
+// pointers, their contents and copy-on-write settings, and the per-container
+// copy-on-write flags. The flags inside the 32-bit containers are not
+// reachable from this package; the 32-bit tests cover them.
+type roaringArray64Snapshot struct {
+	copyOnWrite   bool
+	keys          []uint32
+	containers    []*roaring.Bitmap
+	contents      []*roaring.Bitmap
+	containersCOW []bool
+	flags         []bool
+}
+
+func snapshotRoaringArray64(ra *roaringArray64) roaringArray64Snapshot {
+	s := roaringArray64Snapshot{copyOnWrite: ra.copyOnWrite}
+	s.keys = append(s.keys, ra.keys...)
+	s.containers = append(s.containers, ra.containers...)
+	s.flags = append(s.flags, ra.needCopyOnWrite...)
+	for _, c := range ra.containers {
+		// Clone would flag the containers of a copy-on-write source, so
+		// copy through the serialized form instead.
+		buf, err := c.ToBytes()
+		if err != nil {
+			panic(err)
+		}
+		content := roaring.New()
+		if err := content.UnmarshalBinary(buf); err != nil {
+			panic(err)
+		}
+		s.contents = append(s.contents, content)
+		s.containersCOW = append(s.containersCOW, c.GetCopyOnWrite())
+	}
+	return s
+}
+
+func assertRoaringArray64Unchanged(t *testing.T, s roaringArray64Snapshot, ra *roaringArray64) {
+	t.Helper()
+	assert.Equal(t, s.copyOnWrite, ra.copyOnWrite, "copy-on-write setting changed")
+	if !assert.Equal(t, len(s.keys), len(ra.keys), "number of containers changed") {
+		return
+	}
+	for i := range s.keys {
+		assert.Equal(t, s.keys[i], ra.keys[i], "key %d changed", i)
+		assert.Equal(t, s.flags[i], ra.needCopyOnWrite[i], "copy-on-write flag %d changed", i)
+		assert.True(t, s.containers[i] == ra.containers[i], "container %d was replaced", i)
+		assert.True(t, s.contents[i].Equals(ra.containers[i]), "container %d was modified", i)
+		assert.Equal(t, s.containersCOW[i], ra.containers[i].GetCopyOnWrite(), "container %d copy-on-write setting changed", i)
+	}
+}
+
+// checkRangeAggregation runs both range aggregations of bitmaps over
+// [rangeStart, rangeEnd), checks that the inputs are left untouched, and
+// compares the validated results with the reference. The reference runs last
+// because FastOr and FastAnd clone a single input, and Clone flags the
+// containers of a copy-on-write source.
+func checkRangeAggregation(t *testing.T, rangeStart, rangeEnd uint64, bitmaps ...*Bitmap) {
+	t.Helper()
+	snapshots := make([]roaringArray64Snapshot, len(bitmaps))
+	for i, b := range bitmaps {
+		snapshots[i] = snapshotRoaringArray64(&b.highlowcontainer)
+	}
+	gotOr := FastOrRange(rangeStart, rangeEnd, bitmaps...)
+	gotAnd := FastAndRange(rangeStart, rangeEnd, bitmaps...)
+	for i, b := range bitmaps {
+		assertRoaringArray64Unchanged(t, snapshots[i], &b.highlowcontainer)
+	}
+
+	assert.NoError(t, gotOr.Validate())
+	assert.False(t, gotOr.GetCopyOnWrite())
+	wantOr := referenceOrRange(rangeStart, rangeEnd, bitmaps...)
+	assert.True(t, gotOr.Equals(wantOr), "FastOrRange(%d, %d): got %s, want %s", rangeStart, rangeEnd, gotOr, wantOr)
+
+	assert.NoError(t, gotAnd.Validate())
+	assert.False(t, gotAnd.GetCopyOnWrite())
+	wantAnd := referenceAndRange(rangeStart, rangeEnd, bitmaps...)
+	assert.True(t, gotAnd.Equals(wantAnd), "FastAndRange(%d, %d): got %s, want %s", rangeStart, rangeEnd, gotAnd, wantAnd)
+}
+
+// rangeFixtures returns bitmaps spread over several 32-bit containers: array,
+// bitmap and run containers inside container 0, a run across the boundary of
+// containers 1 and 2, a mixed bitmap with a container gap, values at the top
+// of the value space including math.MaxUint64, and a far-away container.
+func rangeFixtures(cow bool) []*Bitmap {
+	arrays := New()
+	for i := uint64(0); i < 3855; i++ {
+		arrays.Add(i * 17)
+		arrays.Add(1<<16 + i*17)
+	}
+
+	bitmaps := New()
+	for i := uint64(0); i < 1<<16; i += 3 {
+		bitmaps.Add(2<<16 + i)
+		bitmaps.Add(1<<32 + i)
+	}
+
+	runs := New()
+	runs.AddRange(1<<32-70000, 2<<32+5000)
+	runs.AddRange(2<<32+1<<20, 2<<32+1<<20+100)
+	runs.RunOptimize()
+
+	mixed := New()
+	mixed.AddMany([]uint64{5, 10, 15, 1<<32 + 7, 5<<32 + 1})
+	for i := uint64(0); i < 1<<16; i += 2 {
+		mixed.Add(5<<32 + 3<<16 + i)
+	}
+	mixed.AddRange(5<<32+4<<16, 5<<32+6<<16)
+	mixed.RunOptimize()
+
+	top := New()
+	top.AddRange(math.MaxUint64-1000, math.MaxUint64)
+	top.Add(math.MaxUint64)
+	top.Add(math.MaxUint64 - 70000)
+	top.RunOptimize()
+
+	far := New()
+	far.AddMany([]uint64{100 << 32, 100<<32 + 1, 200<<32 + 7})
+
+	fixtures := []*Bitmap{arrays, bitmaps, runs, mixed, top, far}
+	for _, b := range fixtures {
+		b.SetCopyOnWrite(cow)
+	}
+	if cow {
+		fixtures = append(fixtures, fixtures[2].Clone())
+	}
+	return fixtures
+}
+
+func rangeWindows() []struct {
+	name       string
+	start, end uint64
+} {
+	return []struct {
+		name       string
+		start, end uint64
+	}{
+		{"empty start==end", 5, 5},
+		{"empty start>end", 10, 3},
+		{"container gap", 6 << 32, 100 << 32},
+		{"above every key", 201 << 32, math.MaxUint64},
+		{"inside array container", 100, 5000},
+		{"inside bitmap container", 2<<16 + 100, 2<<16 + 5000},
+		{"inside run", 1<<32 + 100, 1<<32 + 5000},
+		{"run straddles both edges", 1<<32 - 50000, 2<<32 + 3000},
+		{"across the container boundary", 1<<32 - 100, 1<<32 + 100},
+		{"container aligned", 1 << 32, 2 << 32},
+		{"single present value", 2<<16 + 3, 2<<16 + 4},
+		{"single absent value", 2<<16 + 4, 2<<16 + 5},
+		{"top of value space", math.MaxUint64 - 5, math.MaxUint64},
+		{"top container", math.MaxUint64 - 100000, math.MaxUint64},
+		{"whole", 0, math.MaxUint64},
+		{"wide", 1<<16 + 5, 200<<32 + 7},
+	}
+}
+
+func TestFastRangeAggregationsWindows(t *testing.T) {
+	for _, cow := range []bool{false, true} {
+		fixtures := rangeFixtures(cow)
+		empty := New()
+		subsets := map[string][]*Bitmap{
+			"none":       {},
+			"empty":      {empty},
+			"empty+runs": {empty, fixtures[2]},
+			"twice":      {fixtures[3], fixtures[3]},
+			"all":        fixtures,
+		}
+		for i, a := range fixtures {
+			subsets[fmt.Sprintf("single%d", i)] = []*Bitmap{a}
+			for j, b := range fixtures[i+1:] {
+				subsets[fmt.Sprintf("pair%d%d", i, i+1+j)] = []*Bitmap{a, b}
+			}
+		}
+		for name, bitmaps := range subsets {
+			for _, w := range rangeWindows() {
+				t.Run(fmt.Sprintf("cow=%v/%s/%s", cow, name, w.name), func(t *testing.T) {
+					checkRangeAggregation(t, w.start, w.end, bitmaps...)
+				})
+			}
+		}
+	}
+}
+
+func TestFastRangeAggregationsResultIsolated(t *testing.T) {
+	// Writes to the results must not reach the inputs and writes to the
+	// inputs must not reach the results, even through shared containers.
+	for _, cow := range []bool{false, true} {
+		for i, b := range rangeFixtures(cow) {
+			t.Run(fmt.Sprintf("cow=%v/input%d", cow, i), func(t *testing.T) {
+				snapshot := snapshotRoaringArray64(&b.highlowcontainer)
+				or := FastOrRange(0, math.MaxUint64, b)
+				and := FastAndRange(1<<16, 3<<32, b, b)
+				for _, r := range []*Bitmap{or, and} {
+					r.Add(1<<32 + 7)
+					r.RemoveRange(0, 1<<32+10)
+					r.Flip(1<<32, 1<<32+64)
+				}
+				assertRoaringArray64Unchanged(t, snapshot, &b.highlowcontainer)
+
+				or = FastOrRange(0, math.MaxUint64, b)
+				and = FastAndRange(1<<16, 3<<32, b, b)
+				orWant := FastOrRange(0, math.MaxUint64, or)
+				andWant := FastOrRange(0, math.MaxUint64, and)
+				b.Add(1<<32 + 3)
+				b.Remove(1 << 32)
+				b.AddRange(2<<32+1, 2<<32+3)
+				b.RemoveRange(5<<32, 6<<32)
+				b.Flip(2<<16, 2<<16+64)
+				assert.True(t, or.Equals(orWant))
+				assert.True(t, and.Equals(andWant))
+			})
+		}
+	}
+}
+
+// randomRangeBitmap builds a bitmap over the given 32-bit containers where
+// every 16-bit container is absent, an array, a bitmap or a set of runs at
+// random, and applies RunOptimize and copy-on-write at random.
+func randomRangeBitmap(rng *rand.Rand, highs []uint64, keys int) *Bitmap {
+	b := New()
+	var values []uint64
+	for _, high := range highs {
+		for key := 0; key < keys; key++ {
+			base := high<<32 + uint64(key)<<16
+			switch rng.Intn(4) {
+			case 0:
+			case 1:
+				values = values[:0]
+				for i, n := 0, 1+rng.Intn(3000); i < n; i++ {
+					values = append(values, base+uint64(rng.Intn(1<<16)))
+				}
+				b.AddMany(values)
+			case 2:
+				values = values[:0]
+				for i, n := 0, 5000+rng.Intn(20000); i < n; i++ {
+					values = append(values, base+uint64(rng.Intn(1<<16)))
+				}
+				b.AddMany(values)
+			case 3:
+				for r, runs := 0, 1+rng.Intn(4); r < runs; r++ {
+					start := uint64(rng.Intn(1 << 16))
+					end := start + 1 + uint64(rng.Intn(20000))
+					if end > 1<<16 {
+						end = 1 << 16
+					}
+					b.AddRange(base+start, base+end)
+				}
+			}
+		}
+	}
+	if rng.Intn(2) == 0 {
+		b.RunOptimize()
+	}
+	if rng.Intn(2) == 0 {
+		b.SetCopyOnWrite(true)
+	}
+	return b
+}
+
+// randomRangeBound returns a range bound that is often on or next to a
+// 32-bit or 16-bit container boundary, sometimes at the top of the value
+// space, and otherwise uniform over the containers in use.
+func randomRangeBound(rng *rand.Rand, highs []uint64, keys int) uint64 {
+	high := highs[rng.Intn(len(highs))]
+	switch rng.Intn(6) {
+	case 0:
+		return high<<32 + uint64(rng.Intn(keys+1))<<16
+	case 1:
+		return high<<32 + uint64(rng.Intn(keys+1))<<16 + uint64(rng.Intn(3))
+	case 2:
+		return high<<32 + uint64(1+rng.Intn(keys+1))<<16 - uint64(1+rng.Intn(2))
+	case 3:
+		return high<<32 + uint64(rng.Intn(3)) - uint64(rng.Intn(2))
+	case 4:
+		return []uint64{math.MaxUint64, math.MaxUint64 - 1, 1 << 40}[rng.Intn(3)]
+	}
+	return high<<32 + uint64(rng.Intn((keys+1)<<16))
+}
+
+func TestFastRangeAggregationsRandom(t *testing.T) {
+	rng := rand.New(rand.NewSource(20260909))
+	highs := []uint64{0, 1, 2, 7, math.MaxUint32}
+	const keys = 3
+	for iteration := 0; iteration < 150; iteration++ {
+		bitmaps := make([]*Bitmap, 1+rng.Intn(4))
+		for i := range bitmaps {
+			if i > 0 && rng.Intn(6) == 0 {
+				bitmaps[i] = bitmaps[rng.Intn(i)]
+				continue
+			}
+			bitmaps[i] = randomRangeBitmap(rng, highs[:1+rng.Intn(len(highs))], keys)
+		}
+		start, end := randomRangeBound(rng, highs, keys), randomRangeBound(rng, highs, keys)
+		if start > end && rng.Intn(4) != 0 {
+			start, end = end, start
+		}
+		checkRangeAggregation(t, start, end, bitmaps...)
+		if t.Failed() {
+			t.Fatalf("iteration %d, range [%d, %d), %d inputs", iteration, start, end, len(bitmaps))
+		}
+	}
 }

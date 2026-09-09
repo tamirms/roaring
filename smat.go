@@ -126,6 +126,11 @@ var smatActionMap = smat.ActionMap{
 	smat.ActionID('f'): smatAction(" flip", smatWrap(smatFlip)),
 
 	smat.ActionID('-'): smatAction(" difference", smatWrap(smatDifference)),
+
+	// This ID sorts after every other action, so the percent table of the
+	// existing actions, and with it the decoding of the existing corpus and
+	// of the recorded hits, is unchanged.
+	smat.ActionID('~'): smatAction(" rangeAggregation", smatWrap(smatRangeAggregation)),
 }
 
 var smatRunningPercentActions []smat.PercentAction
@@ -534,6 +539,42 @@ func smatDifference(c *smatContext) {
 			py.checkEquals()
 		})
 	})
+}
+
+// smatRangeAggregation checks FastOrRange and FastAndRange over [x, y]
+// against the bitset model, and that the inputs are left as they were.
+func smatRangeAggregation(c *smatContext) {
+	c.withPair(c.x, func(px *smatPair) {
+		c.withPair(c.y, func(py *smatPair) {
+			px.Validate()
+			py.Validate()
+			lo, hi := uint64(c.x), uint64(c.y)
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			hi++
+			smatCheckRange("or", FastOrRange(lo, hi, px.bm, py.bm), px.bs.Union(py.bs), lo, hi)
+			smatCheckRange("and", FastAndRange(lo, hi, px.bm, py.bm), px.bs.Intersection(py.bs), lo, hi)
+			px.checkEquals()
+			py.checkEquals()
+		})
+	})
+}
+
+func smatCheckRange(name string, got *Bitmap, model *bitset.BitSet, lo, hi uint64) {
+	if err := got.Validate(); err != nil {
+		panic(fmt.Sprintf("%s range result invalid: %v", name, err))
+	}
+	expected := uint64(0)
+	for i, e := model.NextSet(uint(lo)); e && uint64(i) < hi; i, e = model.NextSet(i + 1) {
+		if !got.Contains(uint32(i)) {
+			panic(fmt.Sprintf("%s range result is missing %d", name, i))
+		}
+		expected++
+	}
+	if got.GetCardinality() != expected {
+		panic(fmt.Sprintf("%s range result has cardinality %d, expected %d", name, got.GetCardinality(), expected))
+	}
 }
 
 func (p *smatPair) checkEquals() {
